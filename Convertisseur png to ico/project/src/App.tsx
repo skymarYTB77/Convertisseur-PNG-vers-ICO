@@ -1,5 +1,5 @@
 import React, { useState, useRef, useCallback } from 'react';
-import { Upload, Download, Image as ImageIcon, AlertCircle, Trash2, Archive } from 'lucide-react';
+import { Upload, Download, Image as ImageIcon, AlertCircle, Trash2, Archive, Settings } from 'lucide-react';
 import JSZip from 'jszip';
 
 interface FileWithPreview {
@@ -8,11 +8,27 @@ interface FileWithPreview {
   optimized: boolean;
 }
 
+interface IconSize {
+  width: number;
+  height: number;
+  usePNG: boolean;
+}
+
+const ICON_SIZES: IconSize[] = [
+  { width: 16, height: 16, usePNG: false },
+  { width: 32, height: 32, usePNG: false },
+  { width: 48, height: 48, usePNG: false },
+  { width: 64, height: 64, usePNG: false },
+  { width: 128, height: 128, usePNG: true },
+  { width: 256, height: 256, usePNG: true }
+];
+
 function App() {
   const [files, setFiles] = useState<FileWithPreview[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [isConverting, setIsConverting] = useState(false);
+  const [optimizedForWindows, setOptimizedForWindows] = useState(true);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleFiles = useCallback((inputFiles: FileList | null) => {
@@ -60,43 +76,171 @@ function App() {
     });
   };
 
-  const convertToIco = async (file: FileWithPreview) => {
-    return new Promise<Blob>((resolve, reject) => {
-      const canvas = document.createElement('canvas');
-      const ctx = canvas.getContext('2d');
+  const createIconHeader = (numImages: number) => {
+    const buffer = new ArrayBuffer(6);
+    const view = new DataView(buffer);
+    view.setUint16(0, 0, true); // Reserved. Must be 0
+    view.setUint16(2, 1, true); // Image type: 1 = ICO
+    view.setUint16(4, numImages, true); // Number of images
+    return buffer;
+  };
+
+  const createIconDirectoryEntry = (width: number, height: number, size: number, offset: number) => {
+    const buffer = new ArrayBuffer(16);
+    const view = new DataView(buffer);
+    view.setUint8(0, width === 256 ? 0 : width); // Width (0 means 256)
+    view.setUint8(1, height === 256 ? 0 : height); // Height (0 means 256)
+    view.setUint8(2, 0); // Color palette
+    view.setUint8(3, 0); // Reserved
+    view.setUint16(4, 1, true); // Color planes
+    view.setUint16(6, 32, true); // Bits per pixel
+    view.setUint32(8, size, true); // Image size in bytes
+    view.setUint32(12, offset, true); // Offset to image data
+    return buffer;
+  };
+
+  const createBMPHeader = (width: number, height: number) => {
+    const buffer = new ArrayBuffer(40); // BITMAPINFOHEADER size
+    const view = new DataView(buffer);
+    view.setUint32(0, 40, true); // Header size
+    view.setInt32(4, width, true); // Width
+    view.setInt32(8, height * 2, true); // Height (doubled for ICO format)
+    view.setUint16(12, 1, true); // Planes
+    view.setUint16(14, 32, true); // Bits per pixel
+    view.setUint32(16, 0, true); // Compression (0 = none)
+    view.setUint32(20, 0, true); // Image size (0 for uncompressed)
+    view.setInt32(24, 0, true); // X pixels per meter
+    view.setInt32(28, 0, true); // Y pixels per meter
+    view.setUint32(32, 0, true); // Colors used
+    view.setUint32(36, 0, true); // Important colors
+    return buffer;
+  };
+
+  const resizeImage = async (img: HTMLImageElement, width: number, height: number, usePNG: boolean): Promise<ArrayBuffer> => {
+    const canvas = document.createElement('canvas');
+    const ctx = canvas.getContext('2d');
+    canvas.width = width;
+    canvas.height = height;
+
+    if (!ctx) throw new Error('Impossible de créer le contexte 2D');
+
+    // Enable transparency and set background to transparent
+    ctx.clearRect(0, 0, width, height);
+    
+    // Maintain aspect ratio
+    const scale = Math.min(width / img.width, height / img.height);
+    const x = (width - img.width * scale) / 2;
+    const y = (height - img.height * scale) / 2;
+
+    // Draw image with high quality
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, x, y, img.width * scale, img.height * scale);
+
+    // Get image data
+    const imageData = ctx.getImageData(0, 0, width, height);
+    const data = imageData.data;
+
+    if (!usePNG) {
+      // For BMP format, we need to:
+      // 1. Create BMP header
+      // 2. Convert RGBA to BGRA
+      // 3. Flip image vertically (BMP is bottom-up)
+      const headerSize = 40; // BITMAPINFOHEADER
+      const pixelDataSize = width * height * 4;
+      const buffer = new ArrayBuffer(headerSize + pixelDataSize);
+      const view = new Uint8Array(buffer);
+
+      // Copy BMP header
+      const header = new Uint8Array(createBMPHeader(width, height));
+      view.set(header, 0);
+
+      // Convert and flip image data
+      for (let y = 0; y < height; y++) {
+        for (let x = 0; x < width; x++) {
+          const sourceOffset = (y * width + x) * 4;
+          const targetOffset = headerSize + ((height - 1 - y) * width + x) * 4;
+
+          // RGBA to BGRA
+          view[targetOffset] = data[sourceOffset + 2]; // B
+          view[targetOffset + 1] = data[sourceOffset + 1]; // G
+          view[targetOffset + 2] = data[sourceOffset]; // R
+          view[targetOffset + 3] = data[sourceOffset + 3]; // A
+        }
+      }
+
+      return buffer;
+    } else {
+      // For PNG format, return as is
+      return new Promise((resolve, reject) => {
+        canvas.toBlob(
+          (blob) => {
+            if (blob) {
+              blob.arrayBuffer().then(resolve).catch(reject);
+            } else {
+              reject(new Error('La conversion a échoué'));
+            }
+          },
+          'image/png'
+        );
+      });
+    }
+  };
+
+  const convertToIco = async (file: FileWithPreview): Promise<Blob> => {
+    return new Promise((resolve, reject) => {
       const img = new Image();
+      img.onload = async () => {
+        try {
+          const iconSizes = optimizedForWindows ? ICON_SIZES : [{ width: 256, height: 256, usePNG: true }];
+          const imageBuffers: { size: IconSize; buffer: ArrayBuffer }[] = [];
 
-      img.onload = () => {
-        canvas.width = 256;
-        canvas.height = 256;
+          // Generate all required sizes
+          for (const size of iconSizes) {
+            const buffer = await resizeImage(img, size.width, size.height, size.usePNG);
+            imageBuffers.push({ size, buffer });
+          }
 
-        if (ctx) {
-          // Enable transparency
-          ctx.clearRect(0, 0, canvas.width, canvas.height);
+          // Calculate total size and create buffers
+          const headerSize = 6;
+          const dirEntrySize = 16;
+          const dirEntriesSize = iconSizes.length * dirEntrySize;
           
-          // Maintain aspect ratio
-          const scale = Math.min(
-            canvas.width / img.width,
-            canvas.height / img.height
-          );
-          const x = (canvas.width - img.width * scale) / 2;
-          const y = (canvas.height - img.height * scale) / 2;
+          let offset = headerSize + dirEntriesSize;
+          const totalSize = imageBuffers.reduce((sum, { buffer }) => sum + buffer.byteLength, offset);
+          
+          const finalBuffer = new ArrayBuffer(totalSize);
+          const finalArray = new Uint8Array(finalBuffer);
 
-          ctx.drawImage(
-            img,
-            x,
-            y,
-            img.width * scale,
-            img.height * scale
-          );
+          // Write header
+          const headerBuffer = createIconHeader(iconSizes.length);
+          finalArray.set(new Uint8Array(headerBuffer), 0);
 
-          canvas.toBlob(
-            (blob) => {
-              if (blob) resolve(blob);
-              else reject(new Error('La conversion a échoué'));
-            },
-            'image/x-icon'
-          );
+          // Write directory entries
+          let currentOffset = offset;
+          imageBuffers.forEach(({ size, buffer }, index) => {
+            const entry = createIconDirectoryEntry(
+              size.width,
+              size.height,
+              buffer.byteLength,
+              currentOffset
+            );
+            finalArray.set(new Uint8Array(entry), headerSize + (index * dirEntrySize));
+            currentOffset += buffer.byteLength;
+          });
+
+          // Write image data
+          imageBuffers.forEach(({ buffer }, index) => {
+            const imageData = new Uint8Array(buffer);
+            const imageOffset = offset + imageBuffers
+              .slice(0, index)
+              .reduce((sum, { buffer }) => sum + buffer.byteLength, 0);
+            finalArray.set(imageData, imageOffset);
+          });
+
+          resolve(new Blob([finalBuffer], { type: 'image/x-icon' }));
+        } catch (err) {
+          reject(err);
         }
       };
 
@@ -172,6 +316,21 @@ function App() {
         </div>
 
         <div className="flex-1 flex flex-col items-center justify-center gap-8">
+          <div className="flex items-center justify-center w-full max-w-4xl mb-4">
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={optimizedForWindows}
+                onChange={(e) => setOptimizedForWindows(e.target.checked)}
+                className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+              <span className="text-gray-300 flex items-center gap-2">
+                <Settings className="w-4 h-4" />
+                Optimisé pour Windows (multi-résolutions)
+              </span>
+            </label>
+          </div>
+
           <div 
             className={`gradient-border w-full max-w-4xl transition-all duration-300 ${
               isDragging ? 'scale-105' : ''
@@ -271,6 +430,7 @@ function App() {
                   relative overflow-hidden px-8 py-4 rounded-full font-medium text-lg
                   transition-all duration-300 transform hover:scale-105
                   bg-gradient-to-r from-blue-600 to-purple-600 hover:from-blue-500 hover:to-purple-500 text-white
+                  ${isConverting ? 'opacity-75 cursor-not-allowed' : ''}
                 `}
               >
                 <div className="flex items-center gap-2">
@@ -282,15 +442,17 @@ function App() {
             </div>
           )}
 
-          <div className="flex items-center justify-center gap-4 text-gray-400">
+          <div className="flex items-center justify-center gap-4 text-gray-400 flex-wrap">
             <div className="flex items-center gap-1">
               <ImageIcon className="w-4 h-4" />
               <p className="text-sm">Support PNG</p>
             </div>
             <div className="w-1 h-1 bg-gray-700 rounded-full"></div>
-            <p className="text-sm">Transparence</p>
+            <p className="text-sm">Transparence 32 bits</p>
             <div className="w-1 h-1 bg-gray-700 rounded-full"></div>
-            <p className="text-sm">Conversion multiple</p>
+            <p className="text-sm">Multi-résolutions</p>
+            <div className="w-1 h-1 bg-gray-700 rounded-full"></div>
+            <p className="text-sm">Compression PNG</p>
           </div>
         </div>
       </div>
